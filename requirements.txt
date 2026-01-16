@@ -1,13 +1,12 @@
 
-# YÊU CẦU CHÍNH
 streamlit>=1.29
 osmnx==1.9.4
-matplotlib>=3.8
-networkx>=3.2
-pandas>=2.1
-numpy<2.0
-geopandas>=0.14
-shapely>=2.0
-pyproj>=3.6
-folium>=0.15
-requests>=2.31
+networkx==3.2.1
+matplotlib==3.8.4
+pandas==2.2.2
+numpy==1.26.4
+geopandas==1.0.1
+shapely==2.0.4
+pyproj==3.6.1
+rtree==1.3.0
+folium==0.15.1
