@@ -273,4 +273,4 @@ if go:
                             
                             fig, ax = ox.plot.plot_graph(G_proj, show=False, close=True, node_size=0, edge_linewidth=0.5)
                             st.pyplot(fig)
-                            st.stop() # Kết thúc
+                            st.stop()
