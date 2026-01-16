@@ -16,6 +16,14 @@ import pandas as pd
 import networkx as nx
 import streamlit as st
 import osmnx as ox
+
+# --- OSMnx v2 compatibility shims (tuỳ chọn) ---
+graph_from_place = ox.graph.graph_from_place
+graph_from_bbox  = ox.graph.graph_from_bbox
+basic_stats      = ox.stats.basic_stats
+plot_graph       = ox.plot.plot_graph
+geocode_to_gdf   = ox.geocoder.geocode_to_gdf
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
 from shapely.geometry import box, Polygon
