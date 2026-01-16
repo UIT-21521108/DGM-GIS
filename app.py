@@ -412,4 +412,3 @@ if go:
         st.session_state["busy"] = False
 else:
     st.info("Chọn chế độ, nhập khu vực, điều chỉnh tham số nếu cần → bấm **Tải & Tính toán**.")
-``
