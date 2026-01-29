@@ -70,17 +70,16 @@ class PlusCell:
     west: float
 
 def pluscode_cell_from_point(lat: float, lon: float, code_len: int) -> PlusCell:
-    """
-    Encode (lat, lon) -> pluscode of length code_len, then decode -> bounding box.
-    """
     code = olc.encode(lat, lon, code_len)
-    area = olc.decode(code)  # gives latitudeLow/High, longitudeLow/High
+    area = olc.decode(code)  # CodeArea
+
+    # openlocationcode CodeArea uses latitudeLo/latitudeHi & longitudeLo/longitudeHi
     return PlusCell(
         pluscode=code,
-        north=float(area.latitudeHigh),
-        south=float(area.latitudeLow),
-        east=float(area.longitudeHigh),
-        west=float(area.longitudeLow),
+        north=float(area.latitudeHi),
+        south=float(area.latitudeLo),
+        east=float(area.longitudeHi),
+        west=float(area.longitudeLo),
     )
 
 def snap_start_bbox_to_grid(north: float, south: float, east: float, west: float, code_len: int) -> Tuple[float, float]:
