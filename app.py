@@ -1,83 +1,36 @@
-
 # app.py
-# Streamlit app: Tính tổng chiều dài mạng lưới đường (OSMnx)
-# - Tương thích OSMnx v1.x/v2.x (tự nhận biết)
-# - Chia lưới (tiling) cho vùng lớn, có delay và concurrency kiểm soát rate-limit
-# - Project CRS phẳng để tránh cảnh báo hình học
-# - Debug rõ ràng: cache/log, bảng lỗi theo tile, sanity check
+# Streamlit app: Road length (KMU) with OSMnx + PlusCode grid tiling
+# A) PlusCode tiling with stable IDs
+# B) Full app.py
+# C) Interactive map to draw bbox/polygon + show pluscode grid
+# D) Cache by pluscode for future re-queries
 
 from __future__ import annotations
 
 import time
-import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import networkx as nx
 import streamlit as st
 import osmnx as ox
 import geopandas as gpd
-from shapely.geometry import box, Polygon
+from shapely.geometry import box, Polygon, shape
 
-warnings.filterwarnings("ignore")  # ẩn bớt warning lặt vặt; cần soi kỹ thì comment dòng này
+import folium
+from folium.plugins import Draw
+from streamlit_folium import st_folium
 
-# =========================
-# OSMnx v1/v2 COMPAT SHIM
-# =========================
-try:
-    OX_MAJOR = int(ox.__version__.split(".")[0])
-except Exception:
-    OX_MAJOR = 2  # giả định môi trường hiện tại là v2 nếu không parse được
+from openlocationcode import openlocationcode as olc
 
-# Alias theo namespace hiện có (v2) hoặc fallback v1
-try:
-    graph_from_place = ox.graph.graph_from_place
-    plot_graph       = ox.plot.plot_graph
-    basic_stats      = ox.stats.basic_stats
-    geocode_to_gdf   = ox.geocoder.geocode_to_gdf
-    project_graph_fn = ox.projection.project_graph
-except AttributeError:
-    graph_from_place = getattr(ox, "graph_from_place", None) or getattr(ox.graph, "graph_from_place")
-    plot_graph       = getattr(ox, "plot_graph", None)
-    basic_stats      = getattr(ox, "basic_stats", None)
-    geocode_to_gdf   = getattr(ox, "geocode_to_gdf", None) or getattr(getattr(ox, "geocoder", object()), "geocode_to_gdf", None)
-    project_graph_fn = getattr(ox, "project_graph", None) or getattr(getattr(ox, "projection", object()), "project_graph", None)
-
-def project_graph_safe(G):
-    return project_graph_fn(G) if project_graph_fn else G
-
-def graph_from_bbox_compat(n: float, s: float, e: float, w: float, network_type: str,
-                           retain_all: bool = True, simplify: bool = True):
-    """
-    OSMnx v2.x: yêu cầu 1 tham số bbox=(west,south,east,north).
-    OSMnx v1.x: chấp nhận 4 tham số (north, south, east, west).
-    """
-    if (n <= s) or (e <= w):
-        raise ValueError(f"Invalid bbox (N<=S or E<=W): N={n}, S={s}, E={e}, W={w}")
-
-    if OX_MAJOR >= 2:
-        # v2: dùng keyword 'bbox' theo thứ tự (west, south, east, north)
-        return ox.graph.graph_from_bbox(
-            bbox=(w, s, e, n),
-            network_type=network_type,
-            retain_all=retain_all,
-            simplify=simplify,
-        )
-    else:
-        # v1: 4 tham số riêng (north, south, east, west)
-        fn = getattr(ox, "graph_from_bbox", None) or getattr(ox.graph, "graph_from_bbox")
-        return fn(
-            n, s, e, w,
-            network_type=network_type,
-            retain_all=retain_all,
-            simplify=simplify,
-        )
 
 # =========================
-# Streamlit UI & Settings
+# Streamlit / OSMnx settings
 # =========================
-st.set_page_config(page_title="Độ dài mạng lưới đường (OSMnx)", page_icon="🗺️", layout="centered")
+st.set_page_config(page_title="KMU by PlusCode Grid (OSMnx)", page_icon="🗺️", layout="wide")
 
 ox.settings.use_cache = True
 ox.settings.log_console = False
@@ -87,293 +40,381 @@ except AttributeError:
     pass
 ox.settings.timeout = 180
 
-st.title("🗺️ Tính chiều dài đường (OSMnx Auto‑Compat)")
-st.caption(f"OSMnx version: **{ox.__version__}**")
+st.title("🗺️ Tính tổng chiều dài mạng lưới đường (KMU) — chia ô theo PlusCode")
+st.caption("PlusCode (Open Location Code) tạo lưới toàn cầu có ID chuẩn; rất tiện lưu DB và truy vấn lại. "
+           "Folium Draw + streamlit-folium cho phép vẽ vùng và trả bbox/geojson về Python. "
+           "OSMnx dùng Overpass để tải mạng đường.")
 
-if "busy" not in st.session_state:
-    st.session_state["busy"] = False
-if "place_text" not in st.session_state:
-    st.session_state["place_text"] = "Ho Chi Minh City, Vietnam"
 
-mode = st.radio("Chọn chế độ nhập:", ["Địa danh (polygon)", "BBox"], horizontal=True)
+# =========================
+# Helpers / Compat (OSMnx 2.x)
+# =========================
+# OSMnx 2.x dùng namespaces; các API dưới đây theo v2.
+graph_from_place = ox.graph.graph_from_place
+graph_from_bbox_v2 = ox.graph.graph_from_bbox
+basic_stats = ox.stats.basic_stats
+plot_graph = ox.plot.plot_graph
+geocode_to_gdf = ox.geocoder.geocode_to_gdf
+project_graph = ox.projection.project_graph
 
-colA, colB = st.columns([2, 1])
-with colA:
-    if mode == "Địa danh (polygon)":
-        preset = st.selectbox(
-            "Gợi ý mẫu",
-            [
-                "—",
-                "District 1, Ho Chi Minh City, Vietnam",
-                "Thu Duc City, Ho Chi Minh City, Vietnam",
-                "Hue, Vietnam",
-                "Hai Chau District, Danang, Vietnam",
-                "Hanoi, Vietnam",
-                "Singapore",
-            ],
-            index=0,
-        )
-        if preset != "—":
-            st.session_state["place_text"] = preset
-        place = st.text_input("Nhập tên địa danh:", key="place_text")
-    else:
-        place = ""
 
-with colB:
-    network_type = st.selectbox(
-        "Loại đường",
-        ["all", "all_public", "drive", "drive_service", "walk", "bike"],
-        index=2,  # mặc định "drive"
-        help="Thử 'drive_service' hoặc 'all' nếu tile bị rỗng."
+# =========================
+# PlusCode utilities
+# =========================
+@dataclass(frozen=True)
+class PlusCell:
+    pluscode: str
+    north: float
+    south: float
+    east: float
+    west: float
+
+def pluscode_cell_from_point(lat: float, lon: float, code_len: int) -> PlusCell:
+    """
+    Encode (lat, lon) -> pluscode of length code_len, then decode -> bounding box.
+    """
+    code = olc.encode(lat, lon, code_len)
+    area = olc.decode(code)  # gives latitudeLow/High, longitudeLow/High
+    return PlusCell(
+        pluscode=code,
+        north=float(area.latitudeHigh),
+        south=float(area.latitudeLow),
+        east=float(area.longitudeHigh),
+        west=float(area.longitudeLow),
     )
 
-with st.expander("⚙️ Tuỳ chọn nâng cao"):
-    autosplit = st.checkbox("Tự chia nhỏ vùng lớn (Auto‑Tiling)", True)
-    area_threshold_km2 = st.number_input("Ngưỡng kích hoạt chia nhỏ (km²)", 1.0, 10000.0, 100.0, 10.0)
-    tile_km = st.slider("Kích thước ô lưới (km)", 1, 25, 8, 1)
-    max_tiles = st.slider("Giới hạn số ô tối đa", 4, 400, 120, 4)
-    delay_s = st.slider("Delay giữa các request (s)", 0.0, 5.0, 1.0, 0.1)
-    concurrency = st.slider("Số luồng tải song song (thread)", 1, 3, 1, 1)
-    show_tiles_outline = st.checkbox("Vẽ viền các ô lưới", True)
+def snap_start_bbox_to_grid(north: float, south: float, east: float, west: float, code_len: int) -> Tuple[float, float]:
+    """
+    Snap start (south, west) down to the pluscode cell boundary so grid iteration aligns.
+    """
+    cell = pluscode_cell_from_point(south, west, code_len)
+    return cell.south, cell.west
 
-with st.expander("🐞 Debug & hiệu chỉnh Overpass"):
-    debug_mode = st.checkbox("Bật debug (log_console)", value=True)
-    use_cache = st.checkbox("Dùng cache OSMnx", value=True)
-    ox.settings.use_cache = use_cache
-    ox.settings.log_console = debug_mode
-    st.caption("Nếu bị throttle/timeout, để concurrency=1 và tăng delay, hoặc thử network_type 'drive_service'/'all'.")
+def iter_pluscode_grid_for_bbox(
+    north: float, south: float, east: float, west: float,
+    code_len: int,
+    max_cells: int
+) -> List[PlusCell]:
+    """
+    Generate pluscode cells that cover the bbox.
+    We iterate aligned to the pluscode grid using decoded cell size.
+    """
+    # snap to grid boundary to avoid duplicates/misalignment
+    start_lat, start_lon = snap_start_bbox_to_grid(north, south, east, west, code_len)
+
+    # Determine cell size (degrees) by decoding one cell at start
+    base = pluscode_cell_from_point(start_lat + 1e-9, start_lon + 1e-9, code_len)
+    cell_h = max(1e-12, base.north - base.south)
+    cell_w = max(1e-12, base.east - base.west)
+
+    cells: List[PlusCell] = []
+    lat = start_lat
+    # Iterate rows
+    while lat < north + cell_h:
+        lon = start_lon
+        while lon < east + cell_w:
+            # Use cell center point to get stable code
+            center_lat = lat + cell_h / 2
+            center_lon = lon + cell_w / 2
+            c = pluscode_cell_from_point(center_lat, center_lon, code_len)
+
+            # Only keep if intersects requested bbox
+            if not (c.east < west or c.west > east or c.north < south or c.south > north):
+                cells.append(c)
+                if len(cells) >= max_cells:
+                    return cells
+
+            lon += cell_w
+        lat += cell_h
+
+    # de-duplicate (can happen near edges due to float rounding)
+    uniq = {}
+    for c in cells:
+        uniq[c.pluscode] = c
+    return list(uniq.values())
+
+def filter_cells_by_polygon(cells: List[PlusCell], poly_wgs84: Polygon) -> List[PlusCell]:
+    """
+    Remove cells that do not intersect the polygon (helps skip sea cells for islands).
+    """
+    out = []
+    for c in cells:
+        cell_poly = box(c.west, c.south, c.east, c.north)
+        if poly_wgs84.intersects(cell_poly):
+            out.append(c)
+    return out
+
 
 # =========================
-# Hàm core
+# Download / Cache by pluscode (D)
 # =========================
-@st.cache_data(show_spinner=False)
-def geocode_place_data(place_name: str):
-    gdf = geocode_to_gdf(place_name)  # 4326
-    gdf_webm = gdf.to_crs(3857)       # mét
-    area_km2 = float(gdf_webm.area.iloc[0] / 1e6)
-    return gdf, gdf_webm, area_km2
-
-def poly_to_tiles(poly_m: Polygon, tile_km: int, max_tiles: int):
-    minx, miny, maxx, maxy = poly_m.bounds
-    step = tile_km * 1000
-    xs = np.arange(minx, maxx, step)
-    ys = np.arange(miny, maxy, step)
-
-    bboxes = []
-    for x in xs:
-        for y in ys:
-            cell = box(x, y, x + step, y + step)
-            if not poly_m.intersects(cell):
-                continue
-            inter = poly_m.intersection(cell)
-            if inter.is_empty:
-                continue
-            inter_wgs = gpd.GeoSeries([inter], crs=3857).to_crs(4326).iloc[0]
-            lon_min, lat_min, lon_max, lat_max = inter_wgs.bounds
-            bboxes.append((lat_max, lat_min, lon_max, lon_min))  # (N, S, E, W)
-            if len(bboxes) >= max_tiles:
-                return bboxes
-    return bboxes
-
-def bbox_to_tiles(n: float, s: float, e: float, w: float, tile_km: int, max_tiles: int):
-    poly = box(w, s, e, n)
-    poly_m = gpd.GeoSeries([poly], crs=4326).to_crs(3857).iloc[0]
-    return poly_to_tiles(poly_m, tile_km, max_tiles)
-
 @st.cache_resource(show_spinner=False)
-def download_graph_bbox_cached(n: float, s: float, e: float, w: float, net_type: str):
-    # v2: bbox=(w,s,e,n); v1: n,s,e,w — đã bọc trong compat
-    return graph_from_bbox_compat(n, s, e, w, net_type, retain_all=True, simplify=True)
+def download_graph_for_pluscode(pluscode: str, n: float, s: float, e: float, w: float, network_type: str):
+    """
+    Cached by (pluscode, bbox, network_type) => good for re-query later.
+    Uses OSMnx v2 graph_from_bbox which expects bbox=(west,south,east,north).
+    """
+    G = graph_from_bbox_v2(
+        bbox=(w, s, e, n),
+        network_type=network_type,
+        retain_all=True,
+        simplify=True
+    )
+    return G
 
-def compose_graphs(graphs):
+def compose_graphs(graphs: List[nx.MultiDiGraph]) -> Optional[nx.MultiDiGraph]:
     graphs = [g for g in graphs if g is not None and len(g) > 0]
     if not graphs:
         return None
     return nx.compose_all(graphs)
 
-def compute_stats_for_graph(G):
-    # G nên là graph đã project sang CRS phẳng/met
-    s = basic_stats(G)
-    length_m = s.get("street_length_total", 0.0)
-    return float(length_m / 1000.0), G.number_of_nodes(), G.number_of_edges()
+def compute_kmu(G: nx.MultiDiGraph) -> Tuple[float, int, int]:
+    """
+    Return (street_length_total_km, nodes, edges). Project first to avoid CRS warnings.
+    """
+    Gp = project_graph(G)
+    s = basic_stats(Gp)
+    km = float(s.get("street_length_total", 0.0) / 1000.0)
+    return km, Gp.number_of_nodes(), Gp.number_of_edges()
+
 
 # =========================
-# Nút sanity check (tile nhỏ chắc chắn có đường)
+# UI: Mode selection
 # =========================
-if st.button("🔎 Quick sanity check (Q1, HCMC)"):
-    try:
-        n, s, e, w = 10.7805, 10.7745, 106.7055, 106.6995
-        Gt = download_graph_bbox_cached(n, s, e, w, "drive_service")
-        if Gt and len(Gt) > 0:
-            Gtp = project_graph_safe(Gt)
-            km, nn, ne = compute_stats_for_graph(Gtp)
-            st.success(f"OK • {km:.2f} km • nodes={nn} • edges={ne}")
+mode = st.radio("Chế độ chọn vùng", ["Địa danh (Place)", "BBox nhập tay", "Vẽ vùng trên bản đồ"], horizontal=True)
+
+left, right = st.columns([1.2, 1])
+
+with left:
+    network_type = st.selectbox(
+        "network_type",
+        ["drive", "drive_service", "all", "walk", "bike", "all_public"],
+        index=1,
+        help="Nếu tile rỗng nhiều, thử drive_service hoặc all."
+    )
+
+    code_len = st.selectbox(
+        "Độ phân giải PlusCode (code length)",
+        [4, 6, 8, 10],
+        index=1,
+        help=(
+            "6: khoảng 0.05° (~vài km, tuỳ vĩ độ), 8: ~0.0025° (~trăm mét), "
+            "10: ~0.000125° (~chục mét)."
+        )
+    )
+
+    max_cells = st.slider("Giới hạn số ô PlusCode (max_cells)", 20, 2000, 400, 20)
+    delay_s = st.slider("Delay giữa các request (Overpass friendly)", 0.0, 3.0, 0.6, 0.1)
+    concurrency = st.slider("Song song tải tiles (khuyến nghị 1)", 1, 3, 1, 1)
+
+    st.divider()
+    st.subheader("Tùy chọn cache/log")
+    use_cache = st.checkbox("OSMnx HTTP cache", value=True)
+    debug_log = st.checkbox("OSMnx log_console", value=False)
+    ox.settings.use_cache = use_cache
+    ox.settings.log_console = debug_log
+
+with right:
+    st.subheader("Trạng thái")
+    st.write(f"OSMnx: **{ox.__version__}**")
+    st.write(f"PlusCode lib: **openlocationcode**")
+    st.caption("Bạn có thể vẽ vùng để tránh lỗi geocode (Nominatim) khi bị chặn.")
+
+
+# =========================
+# Collect region geometry/bbox based on mode
+# =========================
+poly_wgs: Optional[Polygon] = None
+bbox: Optional[Tuple[float, float, float, float]] = None  # (north, south, east, west)
+
+if mode == "Địa danh (Place)":
+    place = st.text_input("Nhập địa danh (ví dụ: Hanoi, Vietnam / Singapore)", value="Singapore")
+    run = st.button("🚀 Tính KMU (Place)", type="primary")
+
+    if run:
+        with st.spinner("Geocoding địa danh (Nominatim)..."):
+            # Geocode to polygon
+            gdf = geocode_to_gdf(place)
+            poly_wgs = gdf.geometry.iloc[0]
+            west, south, east, north = poly_wgs.bounds
+            bbox = (north, south, east, west)
+
+elif mode == "BBox nhập tay":
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        north = st.number_input("North (lat)", value=1.4700, format="%.6f")
+    with c2:
+        south = st.number_input("South (lat)", value=1.2000, format="%.6f")
+    with c3:
+        east = st.number_input("East (lon)", value=104.1000, format="%.6f")
+    with c4:
+        west = st.number_input("West (lon)", value=103.6000, format="%.6f")
+    run = st.button("🚀 Tính KMU (BBox)", type="primary")
+    if run:
+        if north <= south or east <= west:
+            st.error("BBox không hợp lệ: cần North>South và East>West.")
         else:
-            st.warning("Sanity tile rỗng — có thể Overpass đang throttle/timeout.")
-    except Exception as ex:
-        st.error(f"Sanity check lỗi: {ex}")
+            bbox = (north, south, east, west)
+            poly_wgs = None
+
+else:
+    st.markdown("### 🗺️ Vẽ vùng trên bản đồ (Rectangle/Polygon)")
+    st.caption("Dùng Draw để vẽ rectangle/polygon. st_folium trả về bounds và last_active_drawing (GeoJSON).")
+
+    # default center: Singapore
+    center = [1.3521, 103.8198]
+    m = folium.Map(location=center, zoom_start=11, control_scale=True, tiles="OpenStreetMap")
+
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "rectangle": True,
+            "polygon": True
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(m)
+
+    map_ret = st_folium(m, height=520, use_container_width=True)
+
+    # Extract drawing to polygon/bbox
+    if map_ret and map_ret.get("last_active_drawing"):
+        gj = map_ret["last_active_drawing"]
+        geom = gj.get("geometry", None)
+        if geom:
+            poly_wgs = shape(geom)  # shapely geometry in WGS84
+            west, south, east, north = poly_wgs.bounds
+            bbox = (north, south, east, west)
+            st.success(f"Đã nhận vùng vẽ. BBox: N={north:.5f}, S={south:.5f}, E={east:.5f}, W={west:.5f}")
+
+    run = st.button("🚀 Tính KMU (Draw)", type="primary")
+
 
 # =========================
-# Chạy chính
+# Main execution: PlusCode tiling + download + aggregate
 # =========================
-go = st.button("🚀 Tải & Tính toán", type="primary")
-
-if go:
-    if st.session_state["busy"]:
-        st.warning("Hệ thống đang bận. Vui lòng đợi tác vụ trước hoàn tất.")
+if run:
+    if not bbox:
+        st.warning("Chưa có vùng (bbox). Hãy nhập bbox hoặc vẽ vùng / geocode địa danh.")
         st.stop()
-    st.session_state["busy"] = True
 
-    try:
-        target_bboxes = []
+    north, south, east, west = bbox
+    if north <= south or east <= west:
+        st.error("BBox không hợp lệ.")
+        st.stop()
 
-        # ---------- PLACE ----------
-        if mode == "Địa danh (polygon)":
-            if not place.strip():
-                st.error("Vui lòng nhập địa danh.")
-                st.session_state["busy"] = False
-                st.stop()
+    # 1) Generate pluscode grid cells for bbox
+    with st.spinner("Đang tạo lưới PlusCode..."):
+        cells = iter_pluscode_grid_for_bbox(north, south, east, west, code_len=code_len, max_cells=max_cells)
 
-            with st.spinner(f"Geocoding '{place}'..."):
-                gdf_wgs, gdf_m, area_km2 = geocode_place_data(place)
-            st.success(f"Diện tích ước lượng: **{area_km2:,.1f} km²**")
+    # 2) If polygon exists (Place/Draw polygon), filter sea/outside cells
+    if poly_wgs is not None:
+        with st.spinner("Đang lọc ô theo polygon (bỏ ô biển/vùng ngoài)..."):
+            cells = filter_cells_by_polygon(cells, poly_wgs)
 
-            if (not autosplit) or (area_km2 <= area_threshold_km2):
-                st.info("✅ Vùng nhỏ → tải trực tiếp 1 lần.")
-                with st.spinner("Đang tải dữ liệu..."):
-                    G_raw = graph_from_place(place, network_type=network_type)
-                    G_proj = project_graph_safe(G_raw)
-                    km, nn, ne = compute_stats_for_graph(G_proj)
+    if not cells:
+        st.error("Không tạo được ô PlusCode nào trong vùng.")
+        st.stop()
 
-                st.metric("Tổng chiều dài", f"{km:,.2f} km")
-                st.write(f"Nodes: {nn:,} • Edges: {ne:,}")
-                fig, ax = plot_graph(G_proj, show=False, close=True, node_size=0, edge_linewidth=0.5)
-                st.pyplot(fig)
+    st.write(f"✅ Số ô PlusCode sẽ tải: **{len(cells)}** (code_len={code_len})")
 
-                st.session_state["busy"] = False
-                st.stop()
-            else:
-                st.warning(f"⚠️ Vùng lớn (> {area_threshold_km2} km²) → kích hoạt chia lưới.")
-                with st.spinner("Đang tạo ô lưới..."):
-                    target_bboxes = poly_to_tiles(gdf_m.geometry.iloc[0], tile_km, max_tiles)
+    # =========================
+    # C) Viewer: show grid on map (limited number to render)
+    # =========================
+    st.markdown("### 👀 Viewer: PlusCode grid (click để xem ID)")
+    render_limit = min(len(cells), 400)  # prevent huge folium rendering
+    m2 = folium.Map(location=[(north + south) / 2, (east + west) / 2], zoom_start=11, control_scale=True, tiles="OpenStreetMap")
+    # Add bbox outline
+    folium.Rectangle(bounds=[(south, west), (north, east)], color="#0000ff", weight=2, fill=False).add_to(m2)
 
-        # ---------- BBOX ----------
-        else:
-            st.write("Nhập toạ độ BBox (WGS84):")
-            c1, c2, c3, c4 = st.columns(4)
-            north = c1.number_input("North (lat)", value=10.86, format="%.4f")
-            south = c2.number_input("South (lat)", value=10.67, format="%.4f")
-            east  = c3.number_input("East (lon)",  value=106.84, format="%.4f")
-            west  = c4.number_input("West (lon)",  value=106.62, format="%.4f")
+    for c in cells[:render_limit]:
+        folium.Rectangle(
+            bounds=[(c.south, c.west), (c.north, c.east)],
+            color="#ff0000",
+            weight=1,
+            fill=False,
+            tooltip=c.pluscode,
+        ).add_to(m2)
 
-            if north <= south or east <= west:
-                st.error("BBox không hợp lệ (North > South, East > West).")
-                st.session_state["busy"] = False
-                st.stop()
+    st.caption(f"Hiển thị {render_limit}/{len(cells)} ô để tránh lag (tăng code_len hoặc giảm max_cells nếu muốn chi tiết hơn).")
+    st_folium(m2, height=480, use_container_width=True)
 
-            target_bboxes = bbox_to_tiles(north, south, east, west, tile_km, max_tiles) if autosplit else [(north, south, east, west)]
+    # =========================
+    # Download tiles (D)
+    # =========================
+    st.markdown("### ⬇️ Tải dữ liệu đường theo PlusCode tiles")
+    progress = st.progress(0.0)
+    status = st.empty()
 
-        # ---------- TẢI THEO TILE ----------
-        if not target_bboxes:
-            st.error("Không tạo được ô lưới nào. Kiểm tra địa danh/toạ độ.")
-            st.session_state["busy"] = False
-            st.stop()
+    results_rows: List[Dict] = []
+    graphs: List[nx.MultiDiGraph] = []
 
-        st.write(f"📋 Kế hoạch: tải **{len(target_bboxes)}** ô lưới ...")
-        downloaded_graphs, rows = [], []
-        progress = st.progress(0.0)
-        status = st.empty()
+    def fetch_one(idx: int, cell: PlusCell):
+        try:
+            G = download_graph_for_pluscode(cell.pluscode, cell.north, cell.south, cell.east, cell.west, network_type)
+            if G is None or len(G) == 0:
+                return {"pluscode": cell.pluscode, "km": 0.0, "nodes": 0, "edges": 0, "status": "EMPTY"}, None
+            km, nn, ne = compute_kmu(G)
+            return {"pluscode": cell.pluscode, "km": km, "nodes": nn, "edges": ne, "status": "OK"}, G
+        except Exception as ex:
+            return {"pluscode": cell.pluscode, "km": 0.0, "nodes": 0, "edges": 0, "status": f"ERR: {type(ex).__name__}: {ex}"}, None
 
-        def fetch_tile(idx_bbox):
-            idx, (n, s, e, w) = idx_bbox
-            try:
-                Gi = download_graph_bbox_cached(n, s, e, w, network_type)
-                if Gi and len(Gi) > 0:
-                    Gip = project_graph_safe(Gi)
-                    km, nn, ne = compute_stats_for_graph(Gip)
-                    return idx, Gi, km, nn, ne, None
-                return idx, None, 0.0, 0, 0, "Empty graph (no edges for this bbox)"
-            except Exception as ex:
-                return idx, None, 0.0, 0, 0, f"{type(ex).__name__}: {ex}"
-
-        results = []
-        if concurrency == 1:
-            for i, bb in enumerate(target_bboxes, 1):
-                status.text(f"⏳ Đang tải ô {i}/{len(target_bboxes)} ...")
-                results.append(fetch_tile((i, bb)))
-                progress.progress(i / len(target_bboxes))
+    if concurrency == 1:
+        for i, cell in enumerate(cells, start=1):
+            status.text(f"Đang tải {i}/{len(cells)} • {cell.pluscode}")
+            row, g = fetch_one(i, cell)
+            results_rows.append(row)
+            if g is not None:
+                graphs.append(g)
+            progress.progress(i / len(cells))
+            time.sleep(delay_s)
+    else:
+        # limited concurrency, still with tiny delay per completion
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futs = {pool.submit(fetch_one, i, cell): cell.pluscode for i, cell in enumerate(cells, start=1)}
+            done = 0
+            for fut in as_completed(futs):
+                row, g = fut.result()
+                results_rows.append(row)
+                if g is not None:
+                    graphs.append(g)
+                done += 1
+                progress.progress(done / len(cells))
+                status.text(f"Đã xong {done}/{len(cells)}")
                 time.sleep(delay_s)
-        else:
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futs = {pool.submit(fetch_tile, (i, bb)): i for i, bb in enumerate(target_bboxes, 1)}
-                done = 0
-                for fut in as_completed(futs):
-                    results.append(fut.result())
-                    done += 1
-                    progress.progress(done / len(target_bboxes))
-                    status.text(f"⏳ Đã xong {done}/{len(target_bboxes)} ...")
-                    time.sleep(delay_s)
 
-        # Tổng hợp kết quả tile
-        errors = [r for r in results if r[-1]]
-        ok_cnt = sum(1 for r in results if not r[-1])
-        st.write(f"✅ Tiles OK: **{ok_cnt}** / ❌ Tiles lỗi: **{len(errors)}**")
+    # Show per-cell report (with pluscode IDs)
+    df = pd.DataFrame(results_rows).sort_values("pluscode")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.download_button("⬇️ Tải CSV theo PlusCode", df.to_csv(index=False).encode("utf-8"),
+                       file_name="pluscode_tile_stats.csv", mime="text/csv")
 
-        for i, Gi, km, nn, ne, err in sorted(results, key=lambda x: x[0]):
-            if Gi:
-                downloaded_graphs.append(Gi)
-            rows.append({
-                "Tile ID": i,
-                "Length (km)": round(km, 3),
-                "Nodes": nn,
-                "Edges": ne,
-                "Status": "OK" if not err else f"Error: {err}",
-            })
+    # =========================
+    # Aggregate total
+    # =========================
+    st.markdown("### ✅ Tổng hợp KMU")
+    if not graphs:
+        st.error("Không tải được graph nào (tất cả tiles EMPTY/ERR). Thử tăng code_len (ô lớn hơn) hoặc đổi network_type.")
+        st.stop()
 
-        if debug_mode and errors:
-            with st.expander("🧯 Lỗi chi tiết theo tile"):
-                err_df = pd.DataFrame([{"Tile": i, "Error": err} for (i, _, _, _, _, err) in errors]).sort_values("Tile")
-                st.dataframe(err_df, use_container_width=True, hide_index=True)
+    with st.spinner("Đang gộp graphs..."):
+        G_all = compose_graphs(graphs)
 
-        status.text("✅ Hoàn tất tải. Đang gộp đồ thị ...")
+    if G_all is None or len(G_all) == 0:
+        st.error("Graph rỗng sau khi gộp.")
+        st.stop()
 
-        # ---------- GHÉP & TÍNH TỔNG ----------
-        if not downloaded_graphs:
-            st.error("Không tải được dữ liệu đường nào.")
-        else:
-            G = compose_graphs(downloaded_graphs)
-            if not G or len(G) == 0:
-                st.error("Đồ thị rỗng sau khi gộp.")
-            else:
-                with st.spinner("Đang project & tính toán tổng ..."):
-                    Gp = project_graph_safe(G)
-                    total_km, total_nodes, total_edges = compute_stats_for_graph(Gp)
+    total_km, total_nodes, total_edges = compute_kmu(G_all)
 
-                st.divider()
-                c1, c2, c3 = st.columns(3)
-                c1.metric("🛣️ Tổng chiều dài", f"{total_km:,.2f} km")
-                c2.metric("Nodes", f"{total_nodes:,}")
-                c3.metric("Edges", f"{total_edges:,}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🛣️ Tổng chiều dài (KMU)", f"{total_km:,.2f} km")
+    c2.metric("Nodes", f"{total_nodes:,}")
+    c3.metric("Edges", f"{total_edges:,}")
 
-                df = pd.DataFrame(rows).sort_values("Tile ID")
-                with st.expander("📄 Chi tiết từng tile"):
-                    st.dataframe(df, use_container_width=True)
-                    st.download_button("⬇️ Tải CSV", df.to_csv(index=False).encode("utf-8"),
-                                       "road_network_stats.csv", "text/csv")
-
-                fig, ax = plot_graph(Gp, show=False, close=True, node_size=0, edge_linewidth=0.5, edge_color="#333", bgcolor="white")
-                if show_tiles_outline:
-                    # minh hoạ khung tile (WGS84) — chỉ để tham khảo
-                    for (n, s, e, w) in target_bboxes:
-                        xs, ys = [w, e, e, w, w], [s, s, n, n, s]
-                        try:
-                            ax.plot(xs, ys, "r-", linewidth=0.8, alpha=0.6)
-                        except Exception:
-                            pass
-                st.pyplot(fig)
-
-    except Exception as e:
-        st.error(f"Lỗi không mong muốn: {e}")
-        st.exception(e)
-    finally:
-        st.session_state["busy"] = False
+    st.markdown("### 🗺️ Plot graph (static)")
+    fig, ax = plot_graph(project_graph(G_all), show=False, close=True, node_size=0, edge_linewidth=0.5, edge_color="#333", bgcolor="white")
+    st.pyplot(fig)
