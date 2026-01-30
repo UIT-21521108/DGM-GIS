@@ -2,8 +2,10 @@ streamlit
 osmnx>=2.0.0
 networkx
 pandas
+geopandas
 folium
 streamlit-folium
 shapely
 openlocationcode
 matplotlib
+rtree
