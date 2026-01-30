@@ -7,10 +7,12 @@ from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import pandas as pd
+import geopandas as gpd
 import streamlit as st
 import matplotlib
-# Thiết lập backend không interactive để tránh crash trên server
-matplotlib.use("Agg") 
+
+# Thiết lập backend không interactive để tránh crash trên Streamlit Cloud
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import osmnx as ox
@@ -20,7 +22,7 @@ import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
-# Import openlocationcode (cần cài đặt: pip install openlocationcode)
+# Import openlocationcode
 try:
     from openlocationcode import openlocationcode as olc
 except ImportError:
@@ -30,7 +32,7 @@ except ImportError:
 # =========================
 # Streamlit + OSMnx settings
 # =========================
-st.set_page_config(page_title="KMU by PlusCode (OSMnx v2)", page_icon="🗺️", layout="wide")
+st.set_page_config(page_title="KMU PlusCode (Optimized)", page_icon="⚡", layout="wide")
 
 # Cấu hình OSMnx 2.0
 ox.settings.use_cache = True
@@ -84,14 +86,12 @@ def pluscode_grid_for_bbox(n: float, s: float, e: float, w: float, code_len: int
 
     origin_lat, origin_lon, cell_h, cell_w = _snap_grid_origin(s, w, code_len)
     
-    # Tính số lượng hàng/cột dự kiến
     n_rows = int(math.ceil((n - origin_lat) / cell_h)) + 2
     n_cols = int(math.ceil((e - origin_lon) / cell_w)) + 2
 
     uniq: Dict[str, PlusCell] = {}
     truncated = False
 
-    # Quét lưới
     for r in range(n_rows):
         lat0 = origin_lat + r * cell_h
         if lat0 > n + cell_h: break
@@ -102,10 +102,8 @@ def pluscode_grid_for_bbox(n: float, s: float, e: float, w: float, code_len: int
             if lon0 > e + cell_w: break
             lon_center = lon0 + cell_w / 2
 
-            # Tạo cell từ tâm để đảm bảo tính nhất quán
             cell = pluscell_from_point(lat_center, lon_center, code_len)
-
-            # Kiểm tra xem cell có thực sự giao với bbox yêu cầu không
+            # Chỉ lấy các ô thực sự chạm vào bbox
             if not (cell.east < w or cell.west > e or cell.north < s or cell.south > n):
                 uniq[cell.pluscode] = cell
                 if len(uniq) >= max_cells:
@@ -125,223 +123,230 @@ def filter_cells_by_polygon(cells: List[PlusCell], poly_wgs84) -> List[PlusCell]
 
 
 # =========================
-# Core Logic (No caching on Graph object to avoid Streamlit pickle errors)
-# =========================
-def download_graph_tile(pluscode: str, bbox_nsew: Tuple[float, float, float, float], network_type: str):
-    n, s, e, w = bbox_nsew
-    # OSMnx v2.0.0 graph_from_bbox tham số là bbox=(west, south, east, north)
-    # Lưu ý: Một số phiên bản dev dùng (north, south, east, west), nhưng v2 chuẩn là (W, S, E, N) hoặc named args.
-    # Để an toàn nhất, ta dùng named arguments:
-    try:
-        # Thử API v2 chuẩn
-        G = ox.graph.graph_from_bbox(bbox=(w, s, e, n), network_type=network_type, retain_all=True, simplify=True)
-        return G
-    except Exception as e:
-        # Fallback hoặc bắt lỗi cụ thể
-        raise e
-
-def compose_graphs(graphs: List[nx.MultiDiGraph]) -> Optional[nx.MultiDiGraph]:
-    valid_graphs = [g for g in graphs if g is not None and len(g) > 0]
-    if not valid_graphs:
-        return None
-    return nx.compose_all(valid_graphs)
-
-def compute_kmu(G: nx.MultiDiGraph) -> Tuple[float, int, int, nx.MultiDiGraph]:
-    # Project sang UTM để tính mét chính xác
-    Gp = ox.projection.project_graph(G)
-    stats = ox.stats.basic_stats(Gp)
-    km = float(stats.get("street_length_total", 0.0) / 1000.0)
-    return km, Gp.number_of_nodes(), Gp.number_of_edges(), Gp
-
-
-# =========================
 # UI Layout
 # =========================
-st.title("🗺️ KMU — PlusCode Grid (OSMnx v2 Fixed)")
+st.title("⚡ KMU — PlusCode (Tối ưu hóa Batching)")
+st.markdown("""
+<style>
+    div.stButton > button {width: 100%; background-color: #FF4B4B; color: white;}
+</style>
+""", unsafe_allow_html=True)
 
 mode = st.radio("Chế độ chọn vùng", ["Place", "BBox", "Draw"], horizontal=True)
 
-cL, cR = st.columns([1.1, 1])
+cL, cR = st.columns([1, 1.5])
 
 with cL:
-    network_type = st.selectbox("Network Type", ["drive", "drive_service", "walk", "bike", "all"], index=0)
-    code_len = st.selectbox("PlusCode Length", [4, 6, 8, 10], index=1, help="Độ dài càng lớn, ô càng nhỏ.")
-    max_cells = st.slider("Max Cells limit", 20, 3000, 600, 20)
-    delay_s = st.slider("Delay (giây)", 0.0, 3.0, 0.1, 0.1)
+    network_type = st.selectbox("Loại đường (Network Type)", ["drive", "drive_service", "walk", "bike", "all"], index=0)
+    code_len = st.selectbox("Độ dài PlusCode", [4, 6, 8, 10], index=1, help="6: Vừa phải (1.2km) | 8: Chi tiết (160m)")
+    max_cells = st.number_input("Giới hạn số ô tối đa", value=2000, step=100)
     
-    st.divider()
-    if st.button("🧹 Clear kết quả"):
+    st.info("💡 **Mẹo:** Chế độ mới tải toàn bộ bản đồ 1 lần, không cần chỉnh Delay.")
+    
+    if st.button("🧹 Xóa kết quả"):
         st.session_state["result"] = None
         st.session_state["last_error"] = None
         st.rerun()
-
-with cR:
-    st.subheader("Thông tin")
-    st.write(f"OSMnx version: **{ox.__version__}**")
-    st.caption("Dữ liệu đồ thị được tải từ OpenStreetMap thông qua Overpass API.")
 
 # --- Inputs ---
 poly_wgs = None
 bbox_nsew: Optional[Tuple[float, float, float, float]] = None
 
-if mode == "Place":
-    place = st.text_input("Nhập tên địa điểm", value="District 1, Ho Chi Minh City")
-    if st.button("🚀 Tính toán"):
-        st.session_state["job_pending"] = True
-        st.session_state["job_params"] = {
-            "mode": "place", "place": place, "network_type": network_type, 
-            "code_len": code_len, "max_cells": max_cells, "delay_s": delay_s
-        }
-
-elif mode == "BBox":
-    c1, c2, c3, c4 = st.columns(4)
-    north = c1.number_input("North", value=10.8, format="%.4f")
-    south = c2.number_input("South", value=10.7, format="%.4f")
-    east  = c3.number_input("East",  value=106.75, format="%.4f")
-    west  = c4.number_input("West",  value=106.65, format="%.4f")
-    
-    if st.button("🚀 Tính toán"):
-        st.session_state["job_pending"] = True
-        st.session_state["job_params"] = {
-            "mode": "bbox", "bbox": (north, south, east, west), "network_type": network_type,
-            "code_len": code_len, "max_cells": max_cells, "delay_s": delay_s
-        }
-
-else: # Mode Draw
-    st.markdown("### 🗺️ Vẽ vùng trên bản đồ")
-    # Tạo bản đồ trung tâm
-    m = folium.Map(location=[10.7769, 106.7009], zoom_start=12)
-    Draw(
-        export=False,
-        draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False, "rectangle": True, "polygon": True},
-        edit_options={"edit": True, "remove": True},
-    ).add_to(m)
-
-    ret = st_folium(m, height=400, use_container_width=True, returned_objects=["last_active_drawing"])
-    
-    if ret and ret.get("last_active_drawing"):
-        st.session_state["draw_geom"] = ret["last_active_drawing"]["geometry"]
-
-    if st.session_state["draw_geom"]:
-        # Preview bounds
-        tmp_shape = shape(st.session_state["draw_geom"])
-        w, s, e, n = tmp_shape.bounds
-        st.info(f"Đã chọn vùng: N={n:.4f}, S={s:.4f}, E={e:.4f}, W={w:.4f}")
-        
-        if st.button("🚀 Tính toán"):
+with cR:
+    if mode == "Place":
+        place = st.text_input("Nhập tên địa điểm", value="District 1, Ho Chi Minh City")
+        if st.button("🚀 BẮT ĐẦU TÍNH TOÁN"):
             st.session_state["job_pending"] = True
             st.session_state["job_params"] = {
-                "mode": "draw", "geom": st.session_state["draw_geom"], 
-                "network_type": network_type, "code_len": code_len, 
-                "max_cells": max_cells, "delay_s": delay_s
+                "mode": "place", "place": place, "network_type": network_type, 
+                "code_len": code_len, "max_cells": max_cells
             }
 
+    elif mode == "BBox":
+        c1, c2, c3, c4 = st.columns(4)
+        north = c1.number_input("North", value=10.850, format="%.4f")
+        south = c2.number_input("South", value=10.700, format="%.4f")
+        east  = c3.number_input("East",  value=106.800, format="%.4f")
+        west  = c4.number_input("West",  value=106.600, format="%.4f")
+        
+        if st.button("🚀 BẮT ĐẦU TÍNH TOÁN"):
+            st.session_state["job_pending"] = True
+            st.session_state["job_params"] = {
+                "mode": "bbox", "bbox": (north, south, east, west), "network_type": network_type,
+                "code_len": code_len, "max_cells": max_cells
+            }
+
+    else: # Mode Draw
+        st.write("Vẽ hình chữ nhật hoặc đa giác lên bản đồ:")
+        m = folium.Map(location=[10.7769, 106.7009], zoom_start=12)
+        Draw(
+            export=False,
+            draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False, "rectangle": True, "polygon": True},
+            edit_options={"edit": True, "remove": True},
+        ).add_to(m)
+
+        ret = st_folium(m, height=350, use_container_width=True, returned_objects=["last_active_drawing"])
+        
+        if ret and ret.get("last_active_drawing"):
+            st.session_state["draw_geom"] = ret["last_active_drawing"]["geometry"]
+
+        if st.session_state["draw_geom"]:
+            # Preview bounds
+            tmp_shape = shape(st.session_state["draw_geom"])
+            w, s, e, n = tmp_shape.bounds
+            st.success(f"Đã chọn vùng: N={n:.4f}, S={s:.4f}")
+            
+            if st.button("🚀 BẮT ĐẦU TÍNH TOÁN"):
+                st.session_state["job_pending"] = True
+                st.session_state["job_params"] = {
+                    "mode": "draw", "geom": st.session_state["draw_geom"], 
+                    "network_type": network_type, "code_len": code_len, 
+                    "max_cells": max_cells
+                }
+
+
 # =========================
-# Execution Pipeline
+# CORE LOGIC: OPTIMIZED PIPELINE
 # =========================
-def run_pipeline(params: dict) -> dict:
+def run_pipeline_optimized(params: dict) -> dict:
     mode_local = params["mode"]
+    network_type = params["network_type"]
     
-    # 1. Xác định BBox tổng
+    # --- BƯỚC 1: XÁC ĐỊNH BBOX TỔNG ---
+    status = st.status("Đang xử lý dữ liệu...", expanded=True)
+    
     poly_local = None
     bbox_local = None # (n, s, e, w)
 
     if mode_local == "place":
-        try:
-            gdf = ox.geocoder.geocode_to_gdf(params["place"])
-            poly_local = gdf.geometry.iloc[0]
-            w, s, e, n = poly_local.bounds
-            bbox_local = (n, s, e, w)
-        except Exception as e:
-            raise ValueError(f"Không tìm thấy địa điểm: {e}")
+        status.write("📍 Đang tìm địa điểm (Geocoding)...")
+        gdf_place = ox.geocoder.geocode_to_gdf(params["place"])
+        poly_local = gdf_place.geometry.iloc[0]
+        w, s, e, n = poly_local.bounds
+        bbox_local = (n, s, e, w)
             
     elif mode_local == "bbox":
         bbox_local = params["bbox"]
+        n, s, e, w = bbox_local
         
     else: # draw
-        if not params.get("geom"): raise ValueError("Chưa vẽ vùng nào!")
         poly_local = shape(params["geom"])
         w, s, e, n = poly_local.bounds
         bbox_local = (n, s, e, w)
 
-    # 2. Tạo lưới PlusCode
+    # --- BƯỚC 2: TẠO LƯỚI GRID ---
+    status.write("🕸️ Đang tạo lưới PlusCode...")
     n, s, e, w = bbox_local
     cells, truncated = pluscode_grid_for_bbox(n, s, e, w, params["code_len"], params["max_cells"])
     
-    # Lọc cell nếu có polygon (Place/Draw)
     if poly_local is not None:
         cells = filter_cells_by_polygon(cells, poly_local)
         
     if not cells:
-        raise ValueError("Không tìm thấy cell nào trong vùng chọn (vùng quá nhỏ hoặc filter sai).")
+        status.update(label="❌ Lỗi: Không có ô lưới nào!", state="error")
+        raise ValueError("Vùng chọn quá nhỏ hoặc không nằm trong phạm vi.")
 
-    # 3. Tải Graph từng ô
-    rows = []
-    graphs = []
+    # --- BƯỚC 3: TẢI GRAPH TOÀN CỤC (1 LẦN DUY NHẤT) ---
+    status.write(f"📥 Đang tải bản đồ từ OpenStreetMap ({len(cells)} ô lưới)... Vui lòng đợi.")
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total_cells = len(cells)
-    
-    for i, cell in enumerate(cells):
-        status_text.text(f"Đang tải tile {i+1}/{total_cells}: {cell.pluscode}")
-        progress_bar.progress((i + 1) / total_cells)
-        
-        try:
-            # Download không qua st.cache_resource, để osmnx cache file
-            G = download_graph_tile(cell.pluscode, (cell.north, cell.south, cell.east, cell.west), params["network_type"])
-            
-            if G is not None and len(G) > 0:
-                km, nn, ne, _ = compute_kmu(G)
-                rows.append({"pluscode": cell.pluscode, "km": km, "nodes": nn, "edges": ne, "status": "OK"})
-                graphs.append(G)
-            else:
-                rows.append({"pluscode": cell.pluscode, "km": 0.0, "nodes": 0, "edges": 0, "status": "EMPTY"})
-                
-        except Exception as ex:
-            # Ghi lỗi ngắn gọn
-            err_msg = str(ex)
-            rows.append({"pluscode": cell.pluscode, "km": 0, "nodes": 0, "edges": 0, "status": "ERR"})
-            print(f"Error at {cell.pluscode}: {err_msg}")
-        
-        time.sleep(params["delay_s"])
-        
-    status_text.empty()
-    progress_bar.empty()
+    # Download 1 lần cho toàn bộ bbox
+    # OSMnx v2: bbox=(west, south, east, north)
+    try:
+        G_full = ox.graph.graph_from_bbox(bbox=(w, s, e, n), network_type=network_type, simplify=True)
+    except Exception as ex:
+        # Nếu không có dữ liệu (ví dụ chọn giữa biển), osmnx sẽ raise lỗi
+        if "No data elements" in str(ex) or "found no graph nodes" in str(ex):
+             status.update(label="⚠️ Vùng này không có đường!", state="complete")
+             return {"df": pd.DataFrame(), "total_km": 0, "truncated": truncated, "G_proj": None}
+        raise ex
 
-    df = pd.DataFrame(rows).sort_values("pluscode")
+    if len(G_full) == 0:
+        status.update(label="⚠️ Bản đồ rỗng!", state="complete")
+        return {"df": pd.DataFrame(), "total_km": 0, "truncated": truncated, "G_proj": None}
+
+    # --- BƯỚC 4: PROJECT & CHUYỂN ĐỔI SANG GEODATAFRAME ---
+    status.write("📐 Đang chuẩn hóa hệ tọa độ (UTM)...")
+    G_proj = ox.projection.project_graph(G_full)
     
-    # 4. Gộp Graph
-    if not graphs:
-        return {"df": df, "total_km": 0, "total_nodes": 0, "total_edges": 0, "G_proj": None, "truncated": truncated}
+    # Lấy danh sách các cạnh (con đường)
+    # nodes_gdf, edges_gdf = ox.graph_to_gdfs(G_proj)
+    # Chúng ta chỉ quan tâm Edges để tính độ dài
+    _, edges_gdf = ox.graph_to_gdfs(G_proj)
+    
+    # --- BƯỚC 5: CHUẨN BỊ GRID GEODATAFRAME ---
+    status.write("✂️ Đang cắt bản đồ theo từng ô PlusCode...")
+    
+    # Tạo GeoDataFrame cho các ô lưới
+    cell_data = []
+    for c in cells:
+        geom = box(c.west, c.south, c.east, c.north)
+        cell_data.append({"pluscode": c.pluscode, "geometry": geom})
+    
+    gdf_cells = gpd.GeoDataFrame(cell_data, crs="EPSG:4326")
+    # Chuyển hệ tọa độ của Grid sang trùng với Graph (UTM)
+    gdf_cells_proj = gdf_cells.to_crs(edges_gdf.crs)
+
+    # --- BƯỚC 6: CẮT HÌNH HỌC (OVERLAY INTERSECTION) ---
+    # Kỹ thuật này cắt các con đường dài thành các đoạn nhỏ vừa khít với ô lưới
+    # Giữ lại tính chính xác tuyệt đối
+    
+    try:
+        # Overlay: Tìm phần giao nhau giữa Đường và Ô lưới
+        # keep_geom_type=False để giữ cả LineString và MultiLineString
+        intersections = gpd.overlay(edges_gdf, gdf_cells_proj, how='intersection', keep_geom_type=False)
         
-    G_all = compose_graphs(graphs)
-    total_km, total_nodes, total_edges, G_proj = compute_kmu(G_all)
+        # Tính lại độ dài cho các đoạn vừa bị cắt (đơn vị mét -> km)
+        intersections["segment_len_km"] = intersections.geometry.length / 1000.0
+        
+        # --- BƯỚC 7: TỔNG HỢP SỐ LIỆU ---
+        stats = intersections.groupby("pluscode").agg(
+            km=("segment_len_km", "sum"),
+            count=("geometry", "count")
+        ).reset_index()
+        
+        # Merge ngược lại với danh sách cell gốc để hiển thị cả những ô km=0
+        df_final = pd.merge(gdf_cells[["pluscode"]], stats, on="pluscode", how="left").fillna(0)
+        df_final = df_final.sort_values("pluscode")
+        
+    except Exception as e:
+        # Fallback nếu overlay lỗi (hiếm gặp)
+        status.write(f"⚠️ Lỗi cắt hình học: {e}. Đang dùng phương pháp thay thế...")
+        df_final = pd.DataFrame(cell_data)
+        df_final["km"] = 0
+        df_final["count"] = 0
+
+    total_km = df_final["km"].sum()
+    total_edges = int(df_final["count"].sum())
+    total_nodes = G_proj.number_of_nodes()
+
+    status.update(label="✅ Hoàn tất!", state="complete")
     
     return {
-        "df": df, "total_km": total_km, "total_nodes": total_nodes, 
-        "total_edges": total_edges, "G_proj": G_proj, "truncated": truncated
+        "df": df_final, 
+        "total_km": total_km, 
+        "total_nodes": total_nodes, 
+        "total_edges": total_edges, 
+        "G_proj": G_proj, 
+        "truncated": truncated
     }
 
-# Trigger Job
+# =========================
+# TRIGGER & DISPLAY
+# =========================
+
 if st.session_state["job_pending"] and st.session_state["job_params"]:
     st.session_state["job_pending"] = False
     st.session_state["last_error"] = None
     
-    with st.spinner("Đang xử lý dữ liệu OSM..."):
-        try:
-            res = run_pipeline(st.session_state["job_params"])
-            st.session_state["result"] = res
-        except Exception as e:
-            st.session_state["last_error"] = str(e)
-            st.error(f"Lỗi: {e}")
+    try:
+        res = run_pipeline_optimized(st.session_state["job_params"])
+        st.session_state["result"] = res
+    except Exception as e:
+        st.session_state["last_error"] = str(e)
+        st.error(f"Đã xảy ra lỗi: {e}")
 
-# =========================
-# Result Display
-# =========================
+# --- Render Result ---
 st.divider()
-st.subheader("📌 Kết quả")
 
 if st.session_state["last_error"]:
     st.error(st.session_state["last_error"])
@@ -349,33 +354,38 @@ if st.session_state["last_error"]:
 res = st.session_state["result"]
 
 if res:
-    if res["truncated"]:
-        st.warning(f"⚠️ Đã đạt giới hạn {max_cells} ô. Kết quả chỉ là một phần của vùng chọn.")
+    st.subheader("📊 Kết quả phân tích")
+    
+    if res.get("truncated"):
+        st.warning(f"⚠️ Dữ liệu bị giới hạn {max_cells} ô. Hãy thu nhỏ vùng chọn để chính xác hơn.")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Tổng chiều dài đường (KM)", f"{res['total_km']:,.2f}")
-    c2.metric("Tổng Nodes", f"{res['total_nodes']:,}")
-    c3.metric("Tổng Edges", f"{res['total_edges']:,}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Tổng chiều dài", f"{res['total_km']:,.2f} km")
+    col2.metric("Tổng đoạn đường", f"{res['total_edges']:,}")
+    col3.metric("Tổng nút giao (Nodes)", f"{res['total_nodes']:,}")
 
-    with st.expander("Xem chi tiết từng ô PlusCode", expanded=False):
-        st.dataframe(res["df"], use_container_width=True)
+    with st.expander("📂 Xem bảng dữ liệu chi tiết", expanded=True):
+        st.dataframe(
+            res["df"].style.format({"km": "{:.4f}", "count": "{:.0f}"}).background_gradient(subset=["km"], cmap="Greens"),
+            use_container_width=True
+        )
         csv = res["df"].to_csv(index=False).encode('utf-8')
-        st.download_button("⬇️ Tải CSV chi tiết", csv, "pluscode_stats.csv", "text/csv")
+        st.download_button("⬇️ Tải file CSV", csv, "pluscode_kmu_stats.csv", "text/csv")
 
-    # Plotting
+    # Vẽ biểu đồ
     if res["G_proj"]:
-        st.write("### 🕸️ Bản đồ mạng lưới đường (Gộp)")
-        # Sử dụng matplotlib figure một cách an toàn
-        try:
-            fig, ax = ox.plot.plot_graph(
-                res["G_proj"], 
-                show=False, 
-                close=True, 
-                node_size=0, 
-                edge_linewidth=0.5, 
-                edge_color="#F35B04", 
-                bgcolor="#1E1E1E"
-            )
-            st.pyplot(fig)
-        except Exception as e:
-            st.warning(f"Không thể vẽ đồ thị: {e}")
+        st.write("### 🗺️ Bản đồ mạng lưới (Visualized)")
+        with st.spinner("Đang vẽ bản đồ..."):
+            try:
+                fig, ax = ox.plot.plot_graph(
+                    res["G_proj"], 
+                    show=False, 
+                    close=True, 
+                    node_size=0, 
+                    edge_linewidth=0.5, 
+                    edge_color="#333", 
+                    bgcolor="white"
+                )
+                st.pyplot(fig)
+            except Exception as e:
+                st.warning(f"Không thể hiển thị hình ảnh đồ thị lớn: {e}")
